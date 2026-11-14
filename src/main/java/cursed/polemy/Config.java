@@ -1,5 +1,6 @@
-usionpackage cursed.polemy;
+package cursed.polemy;
 
+import cursed.polemy.Polemy;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
 import net.minecraftforge.common.ForgeConfigSpec;
