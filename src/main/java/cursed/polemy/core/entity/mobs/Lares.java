@@ -43,7 +43,7 @@ public class Lares extends PathfinderMob {
     }
 
     public boolean isValidAlly(LivingEntity entity) {
-        if (!entity.isAlive() || entity == this || entity instanceof Lares || entity instanceof Enemy) {
+        if (!entity.isAlive() || entity instanceof Lares || entity instanceof Enemy) {
             return false;
         }
         return entity instanceof AbstractVillagerExtra
@@ -118,6 +118,7 @@ public class Lares extends PathfinderMob {
     }
 
     private class FollowLowestHpAllyGoal extends Goal {
+        private static final int MAX_LARES_PER_ALLY = 3;
         private int recheckTicks;
 
         public FollowLowestHpAllyGoal() {
@@ -146,10 +147,13 @@ public class Lares extends PathfinderMob {
 
             if (Lares.this.targetAlly != null) {
                 LivingEntity ally = Lares.this.targetAlly;
-                double orbitAngle = Lares.this.tickCount * 0.08D;
-                double hoverX = ally.getX() + Math.cos(orbitAngle) * 1.1D;
+                // Offset each Lare by 120 degrees so up to 3 Lares space out evenly around the ally
+                double phaseOffset = (Lares.this.getId() % 3) * ((Math.PI * 2.0D) / 3.0D);
+                double orbitAngle = (Lares.this.tickCount * 0.08D) + phaseOffset;
+
+                double hoverX = ally.getX() + Math.cos(orbitAngle) * 1.15D;
                 double hoverY = ally.getY() + ally.getBbHeight() + 0.7D;
-                double hoverZ = ally.getZ() + Math.sin(orbitAngle) * 1.1D;
+                double hoverZ = ally.getZ() + Math.sin(orbitAngle) * 1.15D;
 
                 Lares.this.moveControl.setWantedPosition(hoverX, hoverY, hoverZ, 1.35D);
             }
@@ -159,16 +163,43 @@ public class Lares extends PathfinderMob {
             List<LivingEntity> allies = Lares.this.level().getEntitiesOfClass(
                     LivingEntity.class,
                     Lares.this.getBoundingBox().inflate(24.0D),
-                    e -> Lares.this.isValidAlly(e)
+                    Lares.this::isValidAlly
             );
 
+            if (allies.isEmpty()) {
+                Lares.this.targetAlly = null;
+                return;
+            }
+
+            // Sort from the lowest current HP to highest, with distance as tie-breaker
             allies.sort(Comparator
                     .comparingDouble(LivingEntity::getHealth)
-                    .thenComparingDouble(e -> Lares.this.distanceToSqr(e)));
+                    .thenComparingDouble(Lares.this::distanceToSqr));
 
-            Lares.this.targetAlly = allies.isEmpty() ? null : allies.get(0);
+            // Pick the lowest-HP ally that has fewer than 3 OTHER Lares assigned
+            for (LivingEntity candidate : allies) {
+                if (this.countOtherLaresTargeting(candidate) < MAX_LARES_PER_ALLY) {
+                    Lares.this.targetAlly = candidate;
+                    return;
+                }
+            }
+
+            // Fallback: if all valid allies already have 3 Lares, assist the lowest-HP ally
+            Lares.this.targetAlly = allies.get(0);
+        }
+
+        private long countOtherLaresTargeting(LivingEntity candidate) {
+            List<Lares> nearbyLares = Lares.this.level().getEntitiesOfClass(
+                    Lares.class,
+                    Lares.this.getBoundingBox().inflate(28.0D),
+                    other -> other.isAlive() && other != Lares.this
+            );
+            return nearbyLares.stream()
+                    .filter(other -> other.targetAlly == candidate)
+                    .count();
         }
     }
+
 
     private class RandomHoverGoal extends Goal {
         public RandomHoverGoal() {

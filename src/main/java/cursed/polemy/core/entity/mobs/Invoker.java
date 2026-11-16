@@ -1,7 +1,6 @@
 package cursed.polemy.core.entity.mobs;
 
 import cursed.polemy.core.entity.AbstractVillagerExtra;
-import cursed.polemy.core.entity.mobs.Lares;
 import cursed.polemy.registry.entities.MobsPolemy;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
@@ -39,7 +38,8 @@ public class Invoker extends AbstractVillagerExtra {
         this.goalSelector.addGoal(0, new FloatGoal(this));
         this.goalSelector.addGoal(1, new CastingSpellGoal());
         this.goalSelector.addGoal(2, new AvoidEntityGoal<>(this, Monster.class, 8.0F, 0.8D, 1.1D));
-        this.goalSelector.addGoal(3, new OpenDoorGoal(this, true));
+        this.goalSelector.addGoal(3, new ReturnToVillageBoundsGoal(this, 64.0D, 28.0D));
+        this.goalSelector.addGoal(4, new OpenDoorGoal(this, true));
 
         this.goalSelector.addGoal(4, new SummonLaresSpellGoal());
         this.goalSelector.addGoal(5, new CastWardSpellGoal());

@@ -38,14 +38,15 @@ public class Sentry extends AbstractVillagerExtra implements RangedAttackMob {
     @Override
     protected void registerGoals() {
         this.goalSelector.addGoal(0, new FloatGoal(this));
-        this.goalSelector.addGoal(1, new OpenDoorGoal(this, true));
+        this.goalSelector.addGoal(1, new ReturnToVillageBoundsGoal(this, 64.0D, 28.0D));
+        this.goalSelector.addGoal(2, new OpenDoorGoal(this, true));
 
-        this.goalSelector.addGoal(2, new AvoidEntityGoal<>(this, Vindicator.class, 16.0F, 1.15D, 1.35D));
+        this.goalSelector.addGoal(3, new AvoidEntityGoal<>(this, Vindicator.class, 16.0F, 1.15D, 1.35D));
 
-        this.goalSelector.addGoal(3, new RangedBowAttackGoal<>(this, 1.0D, 20, 24.0F));
-        this.goalSelector.addGoal(4, new MoveThroughVillageGoal(this, 0.8D, false, 4, () -> true));
-        this.goalSelector.addGoal(5, new WaterAvoidingRandomStrollGoal(this, 0.8D));
-        this.goalSelector.addGoal(6, new LookAtPlayerGoal(this, Player.class, 8.0F));
+        this.goalSelector.addGoal(4, new RangedBowAttackGoal<>(this, 1.0D, 20, 24.0F));
+        this.goalSelector.addGoal(5, new MoveThroughVillageGoal(this, 0.8D, false, 4, () -> true));
+        this.goalSelector.addGoal(6, new WaterAvoidingRandomStrollGoal(this, 0.8D));
+        this.goalSelector.addGoal(7, new LookAtPlayerGoal(this, Player.class, 8.0F));
 
         this.targetSelector.addGoal(1, new HurtByTargetGoal(this, AbstractVillager.class, IronGolem.class, AbstractVillagerExtra.class));
 
