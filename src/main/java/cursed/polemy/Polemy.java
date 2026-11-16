@@ -1,8 +1,12 @@
 package cursed.polemy;
 
 import com.mojang.logging.LogUtils;
+import cursed.polemy.registry.entities.MobsPolemy;
+import cursed.polemy.registry.items.ItemsPolemy;
+import net.minecraft.world.item.CreativeModeTabs;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.BuildCreativeModeTabContentsEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -29,14 +33,25 @@ public class Polemy {
 
         // Register the commonSetup method for modloading
         modEventBus.addListener(this::commonSetup);
-
+        modEventBus.addListener(Polemy::addCreative);
         // Register ourselves for server and other game events we are interested in
         MinecraftForge.EVENT_BUS.register(this);
-
+        MobsPolemy.register(modEventBus);
+        ItemsPolemy.register(modEventBus);
         // Register the item to a creative tab
 
         // Register our mod's ForgeConfigSpec so that Forge can create and load the config file for us
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, Config.SPEC);
+    }
+
+    @SubscribeEvent
+    public static void addCreative(BuildCreativeModeTabContentsEvent event) {
+        if (event.getTabKey() == CreativeModeTabs.SPAWN_EGGS) {
+            event.accept(ItemsPolemy.BAILIFF_SPAWN_EGG);
+            event.accept(ItemsPolemy.SENTRY_SPAWN_EGG);
+            event.accept(ItemsPolemy.INVOKER_SPAWN_EGG);
+            event.accept(ItemsPolemy.LARES_SPAWN_EGG);
+        }
     }
 
     private void commonSetup(final FMLCommonSetupEvent event) {

@@ -1,0 +1,12 @@
+{
+  "entity.polemy.bailiff": "Bailiff",
+  "entity.polemy.sentry": "Sentry",
+  "entity.polemy.invoker": "Invoker",
+  "entity.polemy.lare": "Lare",
+  "entity.polemy.ward_rune": "Ward Rune",
+
+  "item.polemy.bailiff_spawn_egg": "Bailiff Spawn Egg",
+  "item.polemy.sentry_spawn_egg": "Sentry Spawn Egg",
+  "item.polemy.invoker_spawn_egg": "Invoker Spawn Egg",
+  "item.polemy.lare_spawn_egg": "Lare Spawn Egg"
+}
