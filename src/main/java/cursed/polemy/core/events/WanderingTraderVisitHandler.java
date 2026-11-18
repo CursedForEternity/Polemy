@@ -1,14 +1,21 @@
 package cursed.polemy.core.events;
 
 import cursed.polemy.Polemy;
+import cursed.polemy.core.entity.mobs.Rogue;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.MobSpawnType;
 import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.npc.Villager;
 import net.minecraft.world.entity.npc.WanderingTrader;
 import net.minecraft.world.item.ItemStack;
@@ -17,22 +24,70 @@ import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.EntityJoinLevelEvent;
+import net.minecraftforge.event.entity.living.LivingHurtEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 
+import javax.annotation.Nullable;
 import java.util.EnumSet;
 import java.util.List;
+
+import static cursed.polemy.registry.entities.MobsPolemy.ROGUE;
 
 @Mod.EventBusSubscriber(modid = Polemy.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class WanderingTraderVisitHandler {
 
-    // Inject village-trading AI whenever a Wandering Trader spawns
+    // Inject village-trading AI & emergency Rogue morph whenever a Wandering Trader spawns
     @SubscribeEvent
     public static void onTraderJoin(EntityJoinLevelEvent event) {
         if (event.getLevel().isClientSide() || !(event.getEntity() instanceof WanderingTrader trader)) {
             return;
         }
+        // Priority 0 overrides vanilla PanicGoal (priority 1) during raids or monster proximity
+        trader.goalSelector.addGoal(0, new TraderEmergencyRogueGoal(trader));
         trader.goalSelector.addGoal(3, new TraderMingleWithVillagersGoal(trader));
+    }
+
+    // Instantly morphs the Wandering Trader into a Rogue the exact tick it is hit
+    @SubscribeEvent
+    public static void onTraderHurt(LivingHurtEvent event) {
+        if (event.getEntity().level().isClientSide()
+                || !(event.getEntity() instanceof WanderingTrader trader)
+                || !(trader.level() instanceof ServerLevel level)) {
+            return;
+        }
+
+        // Ignore environmental damage (fall, suffocation); morph on any entity/projectile attack
+        if (event.getSource().getEntity() != null) {
+            morphTraderIntoRogue(level, trader, event.getSource().getEntity());
+        }
+    }
+
+    public static void morphTraderIntoRogue(ServerLevel level, WanderingTrader trader, @Nullable Entity attacker) {
+        if (!trader.isAlive()) return;
+
+        CompoundTag savedTraderNbt = new CompoundTag();
+        trader.saveWithoutId(savedTraderNbt);
+
+        Rogue rogue = ROGUE.get().create(level);
+        if (rogue != null) {
+            rogue.moveTo(trader.getX(), trader.getY(), trader.getZ(), trader.getYRot(), trader.getXRot());
+            rogue.finalizeSpawn(level, level.getCurrentDifficultyAt(trader.blockPosition()),
+                    MobSpawnType.CONVERSION, null, null);
+            rogue.setMorphedTraderData(savedTraderNbt);
+
+            // Set attacker as target (AbstractVillagerExtra#canAttack automatically ignores Creative players)
+            if (attacker instanceof LivingEntity livingAttacker) {
+                rogue.setTarget(livingAttacker);
+            }
+
+            level.addFreshEntity(rogue);
+            level.sendParticles(ParticleTypes.SMOKE,
+                    trader.getX(), trader.getY() + 1.0D, trader.getZ(),
+                    14, 0.3D, 0.4D, 0.3D, 0.03D);
+
+            trader.discard();
+        }
     }
 
     // Periodically spawn a Wandering Trader near a peaceful loaded village
@@ -42,7 +97,22 @@ public class WanderingTraderVisitHandler {
             return;
         }
 
-        // Check once every 10 minutes (12,000 ticks) during daytime
+        // Every 20 ticks (1 second): immediately morph any Wandering Trader caught in a Raid
+        if (level.getGameTime() % 20L == 0L) {
+            for (WanderingTrader trader : level.getEntities(EntityType.WANDERING_TRADER, LivingEntity::isAlive)) {
+                var raid = level.getRaidAt(trader.blockPosition());
+                boolean raidNearby = (raid != null && raid.isActive())
+                        || !level.getEntitiesOfClass(net.minecraft.world.entity.raid.Raider.class,
+                        trader.getBoundingBox().inflate(48.0D),
+                        r -> r.isAlive() && !(r instanceof Witch)).isEmpty();
+
+                if (raidNearby) {
+                    morphTraderIntoRogue(level, trader, null);
+                }
+            }
+        }
+
+        // Check once every 10 minutes (12,000 ticks) during daytime for peaceful village visits
         if (level.getGameTime() % 12000L != 0L || !level.isDay()) {
             return;
         }
@@ -51,11 +121,9 @@ public class WanderingTraderVisitHandler {
         for (BlockPos center : villages) {
             if (level.getRaidAt(center) != null) continue;
 
-            // Skip if a Wandering Trader is already visiting this village
             boolean traderPresent = !level.getEntitiesOfClass(WanderingTrader.class, new AABB(center).inflate(64.0D)).isEmpty();
             if (traderPresent) continue;
 
-            // 35% chance per check to visit a village
             if (level.random.nextFloat() < 0.35F) {
                 spawnTraderAtVillage(level, center);
                 break;
@@ -73,7 +141,7 @@ public class WanderingTraderVisitHandler {
             if (level.isLoaded(pos) && level.getBlockState(pos).isAir() && level.getBlockState(pos.below()).isSolid()) {
                 WanderingTrader trader = EntityType.WANDERING_TRADER.spawn(level, pos, MobSpawnType.EVENT);
                 if (trader != null) {
-                    trader.setDespawnDelay(24000); // Stays in the village for 1 full day (20 mins)
+                    trader.setDespawnDelay(24000);
                     trader.getNavigation().moveTo(center.getX(), center.getY(), center.getZ(), 0.65D);
                 }
                 break;
@@ -81,6 +149,46 @@ public class WanderingTraderVisitHandler {
         }
     }
 
+    // =========================================================================
+    // GOAL 1: Morphs Wandering Trader into a Rogue during Raids or Monster Proximity
+    // =========================================================================
+    private static class TraderEmergencyRogueGoal extends Goal {
+        private final WanderingTrader trader;
+
+        public TraderEmergencyRogueGoal(WanderingTrader trader) {
+            this.trader = trader;
+            this.setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+        }
+
+        @Override
+        public boolean canUse() {
+            if (!(this.trader.level() instanceof ServerLevel level)) {
+                return false;
+            }
+
+            boolean activeRaid = level.getRaidAt(this.trader.blockPosition()) != null
+                    && level.getRaidAt(this.trader.blockPosition()).isActive();
+            boolean directlyHurt = this.trader.getLastHurtByMob() != null;
+            boolean monsterClose = !level.getEntitiesOfClass(
+                    Monster.class,
+                    this.trader.getBoundingBox().inflate(12.0D),
+                    m -> m.isAlive() && !(m instanceof Creeper)
+            ).isEmpty();
+
+            return activeRaid || directlyHurt || monsterClose;
+        }
+
+        @Override
+        public void start() {
+            if (this.trader.level() instanceof ServerLevel level) {
+                morphTraderIntoRogue(level, this.trader, this.trader.getLastHurtByMob());
+            }
+        }
+    }
+
+    // =========================================================================
+    // GOAL 2: Wandering Trader Mingles & Trades with Village Residents
+    // =========================================================================
     private static class TraderMingleWithVillagersGoal extends Goal {
         private final WanderingTrader trader;
         private Villager tradePartner;
@@ -108,7 +216,7 @@ public class WanderingTraderVisitHandler {
 
         @Override
         public void start() {
-            this.cooldown = 800; // Trades with a villager every 40 seconds
+            this.cooldown = 800;
             this.trader.getNavigation().moveTo(this.tradePartner, 0.6D);
         }
 

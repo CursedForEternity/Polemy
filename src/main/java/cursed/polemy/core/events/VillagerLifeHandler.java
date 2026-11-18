@@ -8,6 +8,7 @@ import net.minecraft.core.GlobalPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
@@ -28,11 +29,16 @@ import net.minecraft.world.entity.raid.Raid;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.trading.MerchantOffer;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BedPart;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import net.minecraft.world.phys.AABB;
 import net.minecraftforge.event.entity.EntityJoinLevelEvent;
 import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.event.entity.player.PlayerInteractEvent;
+import net.minecraftforge.event.entity.player.PlayerSleepInBedEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.registries.ForgeRegistries;
@@ -54,7 +60,9 @@ public class VillagerLifeHandler {
 
         // Inject custom behavior goals cleanly without breaking vanilla Brain AI
         villager.goalSelector.addGoal(1, new PersonalHomeAndHomelessGoal(villager));
+        villager.goalSelector.addGoal(2, new StayNearVillageAnchorGoal(villager));
         villager.goalSelector.addGoal(3, new ChurchRaidShelterGoal(villager));
+        villager.goalSelector.addGoal(3, new MasonConstructionGoal(villager));
         villager.goalSelector.addGoal(3, new LibrarianEducateNitwitGoal(villager));
         villager.goalSelector.addGoal(3, new BuildIronGolemGoal(villager));
         villager.goalSelector.addGoal(3, new FarmerAnimalBreedAndTradeGoal(villager));
@@ -488,19 +496,50 @@ public class VillagerLifeHandler {
     }
 
     @SubscribeEvent
-    public static void onPlayerSleepInBed(net.minecraftforge.event.entity.player.PlayerSleepInBedEvent event) {
+    public static void onPlayerSleepInBed(PlayerSleepInBedEvent event) {
         if (event.getEntity().level() instanceof ServerLevel level && event.getPos() != null) {
             BlockPos bedPos = event.getPos();
             BlockState state = level.getBlockState(bedPos);
-            if (state.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
-                // Normalize to the HEAD part of the bed so coordinates always match POI lookups
-                if (state.getValue(net.minecraft.world.level.block.BedBlock.PART) == net.minecraft.world.level.block.state.properties.BedPart.FOOT) {
-                    bedPos = bedPos.relative(state.getValue(net.minecraft.world.level.block.BedBlock.FACING));
+            if (state.getBlock() instanceof BedBlock) {
+                if (state.getValue(BedBlock.PART) == BedPart.FOOT) {
+                    bedPos = bedPos.relative(state.getValue(BedBlock.FACING));
                 }
-                VillageBedSavedData.get(level).claimBedForPlayer(bedPos);
+                VillageBedSavedData.get(level).claimBedForPlayer(event.getEntity().getUUID(), bedPos);
             }
         }
     }
+
+    @SubscribeEvent
+    public static void onBedBroken(net.minecraftforge.event.level.BlockEvent.BreakEvent event) {
+        if (!(event.getLevel() instanceof ServerLevel level)) {
+            return;
+        }
+
+        BlockState state = event.getState();
+        if (!(state.getBlock() instanceof BedBlock)) {
+            return;
+        }
+
+        BlockPos headPos = event.getPos();
+        // Normalize to the HEAD block so it matches the stored POI coordinate
+        if (state.getValue(BedBlock.PART) == BedPart.FOOT) {
+            headPos = headPos.relative(state.getValue(BedBlock.FACING));
+        }
+
+        UUID formerOwnerId = VillageBedSavedData.get(level).releaseBed(headPos);
+        if (formerOwnerId != null && level.getEntity(formerOwnerId) instanceof Villager formerOwner) {
+            formerOwner.getBrain().eraseMemory(MemoryModuleType.HOME);
+            formerOwner.playSound(SoundEvents.VILLAGER_NO, 1.0F, 1.0F);
+            level.sendParticles(
+                    ParticleTypes.ANGRY_VILLAGER,
+                    formerOwner.getX(),
+                    formerOwner.getY() + 2.0D,
+                    formerOwner.getZ(),
+                    4, 0.25D, 0.2D, 0.25D, 0.0D
+            );
+        }
+    }
+
 
     @SubscribeEvent
     public static void onVillagerInteract(PlayerInteractEvent.EntityInteract event) {
@@ -952,9 +991,6 @@ public class VillagerLifeHandler {
         }
     }
 
-    // =========================================================================
-    // SMITHS CONSTRUCTING A NEW IRON GOLEM (When Golem is < 25% HP or Dead)
-    // =========================================================================
     private static class BuildIronGolemGoal extends Goal {
         private final Villager smith;
         private BlockPos buildSite;
@@ -1086,4 +1122,689 @@ public class VillagerLifeHandler {
         }
     }
 
+    private static class MasonConstructionGoal extends Goal {
+        private final Villager mason;
+        private BlockPos buildOrigin;
+        private ResourceLocation chosenTemplateId;
+        private Rotation chosenRotation;
+        private int remainingBuildTicks;
+        private int cooldown = 60; // Quick 3-second initial check so newly spawned Masons start promptly
+
+        public MasonConstructionGoal(Villager villager) {
+            this.mason = villager;
+            this.setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+        }
+
+        private Rotation pickRotationFacingNearestRoad(ServerLevel level, StructureTemplate template, BlockPos origin) {
+            BlockPos nearestRoad = this.findNearestRoadBlock(level, origin, 20);
+            if (nearestRoad == null) {
+                return Rotation.getRandom(level.random);
+            }
+
+            // Determine the compass direction from the plot center toward the nearest road
+            net.minecraft.core.Vec3i baseSize = template.getSize();
+            double dx = nearestRoad.getX() - (origin.getX() + baseSize.getX() / 2.0D);
+            double dz = nearestRoad.getZ() - (origin.getZ() + baseSize.getZ() / 2.0D);
+            net.minecraft.core.Direction desiredFront = net.minecraft.core.Direction.getNearest(dx, 0.0D, dz);
+
+            // Detect the template's default front direction from its DoorBlock (defaults to SOUTH if none)
+            net.minecraft.core.Direction templateFront = this.detectTemplateDoorFacing(level, template);
+
+            // Pick the Rotation that turns templateFront into desiredFront
+            for (Rotation rot : Rotation.values()) {
+                if (rot.rotate(templateFront) == desiredFront) {
+                    return rot;
+                }
+            }
+            return Rotation.getRandom(level.random);
+        }
+
+        private net.minecraft.core.Direction detectTemplateDoorFacing(ServerLevel level, StructureTemplate template) {
+            for (BlockState state : this.getTemplateBlockStates(level, template)) {
+                if (state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock
+                        && state.hasProperty(net.minecraft.world.level.block.DoorBlock.FACING)) {
+                    return state.getValue(net.minecraft.world.level.block.DoorBlock.FACING);
+                }
+            }
+            return net.minecraft.core.Direction.SOUTH;
+        }
+
+        @Nullable
+        private BlockPos findNearestRoadBlock(ServerLevel level, BlockPos origin, int radius) {
+            BlockPos nearest = null;
+            double bestDistSq = radius * radius;
+
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    int wx = origin.getX() + dx;
+                    int wz = origin.getZ() + dz;
+                    int wy = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz) - 1;
+                    BlockPos check = new BlockPos(wx, wy, wz);
+                    BlockState state = level.getBlockState(check);
+
+                    if (state.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)
+                            || state.is(net.minecraft.world.level.block.Blocks.SMOOTH_SANDSTONE)
+                            || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)) {
+                        double distSq = check.distSqr(origin);
+                        if (distSq < bestDistSq) {
+                            bestDistSq = distSq;
+                            nearest = check;
+                        }
+                    }
+                }
+            }
+            return nearest;
+        }
+
+
+        @Override
+        public boolean canUse() {
+            if (this.mason.getVillagerData().getProfession() != VillagerProfession.MASON
+                    || this.mason.getVillagerData().getLevel() < 2
+                    || this.mason.isBaby()) {
+                return false;
+            }
+            if (!(this.mason.level() instanceof ServerLevel level) || level.getRaidAt(this.mason.blockPosition()) != null) {
+                return false;
+            }
+            if (--this.cooldown > 0) return false;
+
+            BlockPos center = VillagerLifeHandler.getVillageCenter(level, this.mason.blockPosition());
+            AABB villageBox = new AABB(center).inflate(48.0D);
+
+            long bedCount = level.getPoiManager().getCountInRange(poi -> poi.is(PoiTypes.HOME), center, 48, PoiManager.Occupancy.ANY);
+            long adultCount = level.getEntitiesOfClass(Villager.class, villageBox, v -> v.isAlive() && !v.isBaby()).size();
+
+            List<ResourceLocation> packTemplates = this.collectTemplatesFromVillagePack(level, center);
+            if (packTemplates.isEmpty()) {
+                this.cooldown = 400;
+                return false;
+            }
+
+            if (bedCount < adultCount && bedCount < 16) {
+                this.chosenTemplateId = this.pickHouseTemplate(level, packTemplates);
+            } else {
+                this.chosenTemplateId = this.pickMissingPoiTemplate(level, center, packTemplates);
+                if (this.chosenTemplateId == null && bedCount < (adultCount + 3) && bedCount < 16) {
+                    this.chosenTemplateId = this.pickHouseTemplate(level, packTemplates);
+                }
+            }
+
+            if (this.chosenTemplateId == null) {
+                this.cooldown = 400;
+                return false;
+            }
+
+            Optional<StructureTemplate> templateOpt = level.getStructureManager().get(this.chosenTemplateId);
+            if (templateOpt.isEmpty()) {
+                this.cooldown = 200;
+                return false;
+            }
+
+            StructureTemplate template = templateOpt.get();
+
+            // 1. Find a valid flat plot using the base structure dimensions
+            this.buildOrigin = this.findValidPlot(level, center, template.getSize());
+            if (this.buildOrigin == null) {
+                this.cooldown = 200;
+                return false;
+            }
+
+            // 2. Rotate the building so its front door faces the nearest village road
+            this.chosenRotation = this.pickRotationFacingNearestRoad(level, template, this.buildOrigin);
+
+            // 3. Re-validate if 90/270 degree rotation swapped the X and Z footprint dimensions
+            net.minecraft.core.Vec3i rotatedSize = template.getSize(this.chosenRotation);
+            if (rotatedSize.getX() != template.getSize().getX() || rotatedSize.getZ() != template.getSize().getZ()) {
+                BlockPos recheckedOrigin = this.findValidPlot(level, center, rotatedSize);
+                if (recheckedOrigin == null) {
+                    this.cooldown = 200;
+                    return false;
+                }
+                this.buildOrigin = recheckedOrigin;
+                this.chosenRotation = this.pickRotationFacingNearestRoad(level, template, this.buildOrigin);
+            }
+
+            long solidBlockCount = 0;
+            for (BlockState state : this.getTemplateBlockStates(level, template)) {
+                if (!state.isAir() && !state.is(net.minecraft.world.level.block.Blocks.STRUCTURE_VOID)) {
+                    solidBlockCount++;
+                }
+            }
+            this.remainingBuildTicks = (int) Math.max(100, solidBlockCount * 2);
+            return true;
+        }
+
+        @Override
+        public void start() {
+            this.cooldown = 12000; // 10-minute cooldown after completing/starting a build
+            this.mason.getPersistentData().putBoolean("IsConstructing", true);
+            this.mason.setItemInHand(InteractionHand.MAIN_HAND, new ItemStack(Items.STONE_BRICKS));
+            this.mason.getNavigation().moveTo(this.buildOrigin.getX() - 1.5D, this.buildOrigin.getY(), this.buildOrigin.getZ() - 1.5D, 0.7D);
+        }
+
+        @Override
+        public boolean canContinueToUse() {
+            if (!(this.mason.level() instanceof ServerLevel level)) return false;
+            if (level.getRaidAt(this.mason.blockPosition()) != null) return false;
+            return this.remainingBuildTicks > 0 && this.buildOrigin != null;
+        }
+
+        @Override
+        public void tick() {
+            if (!(this.mason.level() instanceof ServerLevel level)) return;
+
+            if (this.mason.blockPosition().distSqr(this.buildOrigin) > 36.0D) {
+                if (this.mason.tickCount % 20 == 0) {
+                    this.mason.getNavigation().moveTo(this.buildOrigin.getX() - 1.5D, this.buildOrigin.getY(), this.buildOrigin.getZ() - 1.5D, 0.7D);
+                }
+                return;
+            }
+
+            // Stand beside plot untradable, channeling the 2s/block timer
+            this.mason.getNavigation().stop();
+            this.mason.getLookControl().setLookAt(this.buildOrigin.getX() + 2.0D, this.buildOrigin.getY() + 1.0D, this.buildOrigin.getZ() + 2.0D);
+            this.remainingBuildTicks--;
+
+            if (this.mason.tickCount % 25 == 0) {
+                this.mason.swing(InteractionHand.MAIN_HAND);
+                level.playSound(null, this.mason.blockPosition(), SoundEvents.STONE_PLACE, SoundSource.NEUTRAL, 0.8F, 1.0F);
+                level.sendParticles(ParticleTypes.CLOUD,
+                        this.buildOrigin.getX() + 2.0D, this.buildOrigin.getY() + 0.5D, this.buildOrigin.getZ() + 2.0D,
+                        6, 1.5D, 0.3D, 1.5D, 0.02D);
+            }
+
+            if (this.remainingBuildTicks <= 0) {
+                this.pasteStructureWithBlending(level);
+            }
+        }
+
+        private List<ResourceLocation> collectTemplatesFromVillagePack(ServerLevel level, BlockPos center) {
+            Set<ResourceLocation> results = new LinkedHashSet<>();
+            var structureRegistry = level.registryAccess().registryOrThrow(net.minecraft.core.registries.Registries.STRUCTURE);
+
+            // Inspect all structures overlapping the village center (detects custom village packs like CTOV, Terralith, Better Villages, etc.)
+            var structuresAtCenter = level.structureManager().getAllStructuresAt(center);
+            for (var structure : structuresAtCenter.keySet()) {
+                ResourceLocation structId = structureRegistry.getKey(structure);
+                if (structId == null) continue;
+
+                String packNamespace = structId.getNamespace();
+                String structPath = structId.getPath().toLowerCase(Locale.ROOT);
+
+                // Extract biome/theme keyword from the village structure name (e.g. "plains", "taiga", "desert", "medieval")
+                String themeKeyword = this.extractThemeKeyword(structPath, level, center);
+
+                // Scan all house/building .nbt files inside THAT village pack's namespace
+                var packResources = level.getServer().getResourceManager().listResources("structures",
+                        loc -> loc.getNamespace().equals(packNamespace)
+                                && loc.getPath().endsWith(".nbt")
+                                && (loc.getPath().contains("/house") || loc.getPath().contains("/houses") || loc.getPath().contains("/building")));
+
+                // First pass: templates in the same pack that match the village's biome/theme keyword
+                for (ResourceLocation res : packResources.keySet()) {
+                    String clean = res.getPath().substring("structures/".length(), res.getPath().length() - ".nbt".length());
+                    if (clean.toLowerCase(Locale.ROOT).contains(themeKeyword)) {
+                        results.add(new ResourceLocation(packNamespace, clean));
+                    }
+                }
+
+                // Second pass: if no theme-specific match was found in that pack, include any house from that pack
+                if (results.isEmpty()) {
+                    for (ResourceLocation res : packResources.keySet()) {
+                        String clean = res.getPath().substring("structures/".length(), res.getPath().length() - ".nbt".length());
+                        results.add(new ResourceLocation(packNamespace, clean));
+                    }
+                }
+            }
+
+            // Fallback: if spawned via Spawn Egg outside a generated structure, use biome namespace or vanilla biome village
+            if (results.isEmpty()) {
+                String fallbackBiome = this.getVanillaBiomeFolder(level, center);
+                var vanillaResources = level.getServer().getResourceManager().listResources(
+                        "structures/village/" + fallbackBiome + "/houses",
+                        loc -> loc.getPath().endsWith(".nbt"));
+
+                for (ResourceLocation res : vanillaResources.keySet()) {
+                    String clean = res.getPath().substring("structures/".length(), res.getPath().length() - ".nbt".length());
+                    results.add(new ResourceLocation(res.getNamespace(), clean));
+                }
+            }
+
+            return new ArrayList<>(results);
+        }
+
+        private String extractThemeKeyword(String structPath, ServerLevel level, BlockPos pos) {
+            for (String theme : List.of("plains", "taiga", "desert", "savanna", "snowy", "jungle", "swamp", "badlands", "mesa", "cherry", "birch", "dark_forest")) {
+                if (structPath.contains(theme)) {
+                    return theme;
+                }
+            }
+            return this.getVanillaBiomeFolder(level, pos);
+        }
+        private String getVanillaBiomeFolder(ServerLevel level, BlockPos pos) {
+            var biomeHolder = level.getBiome(pos);
+            if (biomeHolder.is(net.minecraft.tags.BiomeTags.HAS_VILLAGE_TAIGA)) return "taiga";
+            if (biomeHolder.is(net.minecraft.tags.BiomeTags.HAS_VILLAGE_DESERT)) return "desert";
+            if (biomeHolder.is(net.minecraft.tags.BiomeTags.HAS_VILLAGE_SAVANNA)) return "savanna";
+            if (biomeHolder.is(net.minecraft.tags.BiomeTags.HAS_VILLAGE_SNOWY)) return "snowy";
+            return "plains";
+        }
+
+        private List<BlockState> getTemplateBlockStates(ServerLevel level, StructureTemplate template) {
+            List<BlockState> results = new ArrayList<>();
+            CompoundTag nbt = template.save(new CompoundTag());
+            net.minecraft.nbt.ListTag paletteTag = nbt.getList("palette", net.minecraft.nbt.Tag.TAG_COMPOUND);
+            net.minecraft.nbt.ListTag blocksTag = nbt.getList("blocks", net.minecraft.nbt.Tag.TAG_COMPOUND);
+
+            if (paletteTag.isEmpty() || blocksTag.isEmpty()) return results;
+
+            List<BlockState> paletteStates = new ArrayList<>(paletteTag.size());
+            var blockLookup = level.holderLookup(net.minecraft.core.registries.Registries.BLOCK);
+            for (int i = 0; i < paletteTag.size(); i++) {
+                paletteStates.add(net.minecraft.nbt.NbtUtils.readBlockState(blockLookup, paletteTag.getCompound(i)));
+            }
+            for (int i = 0; i < blocksTag.size(); i++) {
+                int stateIndex = blocksTag.getCompound(i).getInt("state");
+                if (stateIndex >= 0 && stateIndex < paletteStates.size()) {
+                    results.add(paletteStates.get(stateIndex));
+                }
+            }
+            return results;
+        }
+
+        private Set<PoiType> detectWorkstationPoisInTemplate(ServerLevel level, ResourceLocation templateId) {
+            Set<PoiType> detected = new HashSet<>();
+            Optional<StructureTemplate> templateOpt = level.getStructureManager().get(templateId);
+            if (templateOpt.isEmpty()) return detected;
+
+            List<BlockState> states = this.getTemplateBlockStates(level, templateOpt.get());
+            for (BlockState state : states) {
+                if (state.isAir() || state.getBlock() instanceof BedBlock) continue;
+
+                for (PoiType poiType : ForgeRegistries.POI_TYPES.getValues()) {
+                    ResourceLocation poiKey = ForgeRegistries.POI_TYPES.getKey(poiType);
+                    if (poiKey == null || poiKey.equals(PoiTypes.HOME.location()) || poiKey.equals(PoiTypes.MEETING.location())) {
+                        continue;
+                    }
+                    if (poiType.matchingStates().contains(state)) {
+                        detected.add(poiType);
+                    }
+                }
+            }
+            return detected;
+        }
+
+        @Nullable
+        private ResourceLocation pickHouseTemplate(ServerLevel level, List templates) {
+            List pureHouses = new ArrayList<>();
+            for (Object id : templates) {
+                if (this.detectWorkstationPoisInTemplate(level, (ResourceLocation) id).isEmpty()) {
+                    pureHouses.add(id);
+                }
+            }
+            List pool = pureHouses.isEmpty() ? templates : pureHouses;
+            return (ResourceLocation) pool.get(level.random.nextInt(pool.size()));
+        }
+        @Nullable
+        private ResourceLocation pickMissingPoiTemplate(ServerLevel level, BlockPos center, List packTemplates) {
+            List tier1Food = new ArrayList<>();
+            List tier2GuardProd = new ArrayList<>();
+            List tier3Other = new ArrayList<>();
+// Search the village's own pack first; fall back to vanilla biome folder if the pack lacks a specific POI
+            List searchPool = new ArrayList<>(packTemplates);
+            String fallbackBiome = this.getVanillaBiomeFolder(level, center);
+            var vanillaResources = level.getServer().getResourceManager().listResources(
+                    "structures/village/" + fallbackBiome + "/houses",
+                    loc -> loc.getNamespace().equals("minecraft") && loc.getPath().endsWith(".nbt"));
+            for (ResourceLocation res : vanillaResources.keySet()) {
+                String clean = res.getPath().substring("structures/".length(), res.getPath().length() - ".nbt".length());
+                ResourceLocation loc = new ResourceLocation("minecraft", clean);
+                if (!searchPool.contains(loc)) searchPool.add(loc);
+            }
+            for (Object templateId : searchPool) {
+                Set poisInTemplate = this.detectWorkstationPoisInTemplate(level, (ResourceLocation) templateId);
+                if (poisInTemplate.isEmpty()) continue;
+                for (Object poiType : poisInTemplate) {
+                    long existingCount = level.getPoiManager().getCountInRange(
+                            holder -> holder.value() == poiType, center, 48, PoiManager.Occupancy.ANY);
+                    if (existingCount == 0) {
+                        int priority = this.getPoiPriorityTier((PoiType) poiType);
+                        if (priority == 1) tier1Food.add(templateId);
+                        else if (priority == 2) tier2GuardProd.add(templateId);
+                        else tier3Other.add(templateId);
+                    }
+                }
+            }
+            if (!tier1Food.isEmpty()) return (ResourceLocation) tier1Food.get(level.random.nextInt(tier1Food.size()));
+            if (!tier2GuardProd.isEmpty()) return (ResourceLocation) tier2GuardProd.get(level.random.nextInt(tier2GuardProd.size()));
+            if (!tier3Other.isEmpty()) return (ResourceLocation) tier3Other.get(level.random.nextInt(tier3Other.size()));
+            return null;
+        }
+        private int getPoiPriorityTier(PoiType poiType) {
+            ResourceLocation id = ForgeRegistries.POI_TYPES.getKey(poiType);
+            if (id == null) return 3;
+            String path = id.getPath().toLowerCase(Locale.ROOT);
+            if (id.equals(PoiTypes.FARMER.location()) || id.equals(PoiTypes.BUTCHER.location()) || id.equals(PoiTypes.FISHERMAN.location())
+                    || path.contains("farm") || path.contains("butcher") || path.contains("fish") || path.contains("cook") || path.contains("baker")) {
+                return 1;
+            }
+            if (id.equals(PoiTypes.ARMORER.location()) || id.equals(PoiTypes.WEAPONSMITH.location()) || id.equals(PoiTypes.FLETCHER.location())
+                    || id.equals(PoiTypes.CLERIC.location()) || id.equals(PoiTypes.TOOLSMITH.location())
+                    || path.contains("smith") || path.contains("armor") || path.contains("weapon") || path.contains("fletch")
+                    || path.contains("cleric") || path.contains("priest") || path.contains("guard") || path.contains("forge")) {
+                return 2;
+            }
+            return 3;
+        }
+        @Nullable
+        private BlockPos findValidPlot(ServerLevel level, BlockPos center, net.minecraft.core.Vec3i size)
+        {
+            int width = size.getX();
+            int height = size.getY();
+            int depth = size.getZ();
+
+            // Collect bounding boxes of all already-generated village building pieces to prevent overlap
+            List<net.minecraft.world.level.levelgen.structure.BoundingBox> existingPieces = new ArrayList<>();
+            var structuresAtCenter = level.structureManager().getAllStructuresAt(center);
+            for (var entry : structuresAtCenter.entrySet()) {
+                var start = level.structureManager().getStructureAt(center, entry.getKey());
+                if (start.isValid()) {
+                    for (var piece : start.getPieces()) {
+                        // Inflate by 2 blocks horizontally so new houses leave a clean walkway gap
+                        existingPieces.add(piece.getBoundingBox().inflatedBy(2));
+                    }
+                }
+            }
+
+            for (int attempt = 0; attempt < 60; attempt++) {
+                int x = center.getX() + level.random.nextInt(64) - 32;
+                int z = center.getZ() + level.random.nextInt(64) - 32;
+                int baseY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+
+                int minY = baseY;
+                int maxY = baseY;
+                boolean validPlot = true;
+
+                // 1. Check the X * Z footprint (plus 1-block road buffer) for flatness and valid ground
+                for (int dx = -1; dx <= width && validPlot; dx++) {
+                    for (int dz = -1; dz <= depth && validPlot; dz++) {
+                        boolean insideFootprint = dx >= 0 && dx < width && dz >= 0 && dz < depth;
+                        int checkY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x + dx, z + dz);
+
+                        if (insideFootprint) {
+                            minY = Math.min(minY, checkY);
+                            maxY = Math.max(maxY, checkY);
+                        }
+
+                        BlockPos groundPos = new BlockPos(x + dx, checkY - 1, z + dz);
+                        BlockState groundState = level.getBlockState(groundPos);
+
+                        // Reject water/lava, roads, or artificial blocks while accepting any modded dirt/sand/stone/snow
+                        if (!groundState.getFluidState().isEmpty()
+                                || groundState.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)
+                                || groundState.is(net.minecraft.world.level.block.Blocks.SMOOTH_SANDSTONE)
+                                || groundState.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                                || !this.isNaturalTerrainBlock(groundState)) {
+                            validPlot = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (!validPlot || (maxY - minY) > 2) {
+                    continue;
+                }
+
+                // 2. Check if the full 3D structure hitbox (width x height x depth) intersects any existing village piece
+                net.minecraft.world.level.levelgen.structure.BoundingBox candidateBox =
+                        new net.minecraft.world.level.levelgen.structure.BoundingBox(
+                                x, maxY, z,
+                                x + width - 1, maxY + height - 1, z + depth - 1
+                        );
+
+                for (var pieceBox : existingPieces) {
+                    if (candidateBox.intersects(pieceBox)) {
+                        validPlot = false;
+                        break;
+                    }
+                }
+                if (!validPlot) continue;
+
+                // 3. Verify the full X * Y * Z volume above ground contains no solid blocks (trees, walls, roofs)
+                for (int dx = 0; dx < width && validPlot; dx++) {
+                    for (int dz = 0; dz < depth && validPlot; dz++) {
+                        for (int dy = 0; dy < height; dy++) {
+                            BlockState volState = level.getBlockState(new BlockPos(x + dx, maxY + dy, z + dz));
+                            if (!volState.isAir() && volState.isSolid()) {
+                                validPlot = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (validPlot) {
+                    return new BlockPos(x, maxY, z);
+                }
+            }
+            return null;
+        }
+
+        private boolean isNaturalTerrainBlock(BlockState state) {
+            // Uses Forge/Vanilla block tags so custom modded dirt, sand, stone, terracotta, and snow all work automatically
+            return state.is(net.minecraft.tags.BlockTags.DIRT)
+                    || state.is(net.minecraft.tags.BlockTags.SAND)
+                    || state.is(net.minecraft.tags.BlockTags.SNOW)
+                    || state.is(net.minecraft.tags.BlockTags.TERRACOTTA)
+                    || state.is(net.minecraft.tags.BlockTags.BASE_STONE_OVERWORLD);
+        }
+
+        private void pasteStructureWithBlending(ServerLevel level) {
+            Optional<StructureTemplate> templateOpt = level.getStructureManager().get(this.chosenTemplateId);
+            if (templateOpt.isEmpty()) return;
+
+            StructureTemplate template = templateOpt.get();
+            net.minecraft.core.Vec3i size = template.getSize(this.chosenRotation);
+            boolean isDesert = level.getBiome(this.buildOrigin).is(net.minecraft.tags.BiomeTags.HAS_VILLAGE_DESERT);
+
+            // Sample actual terrain block underneath so custom modded ground blends naturally
+            BlockPos samplePos = this.buildOrigin.below();
+            BlockState sampledGround = level.getBlockState(samplePos);
+            BlockState foundationBlock = sampledGround.isSolidRender(level, samplePos)
+                    ? sampledGround
+                    : (isDesert ? net.minecraft.world.level.block.Blocks.SMOOTH_SANDSTONE.defaultBlockState()
+                    : net.minecraft.world.level.block.Blocks.COBBLESTONE.defaultBlockState());
+
+            // 1. Clear surface grass, flowers, and snow layers inside the exact footprint
+            for (BlockPos clearPos : BlockPos.betweenClosed(
+                    this.buildOrigin,
+                    this.buildOrigin.offset(size.getX() - 1, size.getY() - 1, size.getZ() - 1))) {
+                BlockState existing = level.getBlockState(clearPos);
+                if (!existing.isAir() && !existing.isSolid() && existing.getFluidState().isEmpty()) {
+                    level.removeBlock(clearPos, false);
+                }
+            }
+
+            // 2. Build downward foundation plinth beneath footprint so structure never floats on slopes
+            for (int x = 0; x < size.getX(); x++) {
+                for (int z = 0; z < size.getZ(); z++) {
+                    BlockPos floorPos = this.buildOrigin.offset(x, -1, z);
+                    for (int depth = 0; depth < 8; depth++) {
+                        BlockPos supportPos = floorPos.below(depth);
+                        if (level.getBlockState(supportPos).isSolid()) break;
+                        level.setBlock(supportPos, foundationBlock, 3);
+                    }
+                }
+            }
+
+            // 3. Adjust anchor for rotation so rotated houses stay strictly inside [buildOrigin, buildOrigin + size]
+            BlockPos transformedOrigin = StructureTemplate.getZeroPositionWithTransform(
+                    this.buildOrigin,
+                    net.minecraft.world.level.block.Mirror.NONE,
+                    this.chosenRotation,
+                    size.getX(),
+                    size.getZ()
+            );
+
+            net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings settings =
+                    new net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings()
+                            .setRotation(this.chosenRotation)
+                            .addProcessor(net.minecraft.world.level.levelgen.structure.templatesystem.JigsawReplacementProcessor.INSTANCE)
+                            .addProcessor(net.minecraft.world.level.levelgen.structure.templatesystem.BlockIgnoreProcessor.STRUCTURE_AND_AIR);
+
+            template.placeInWorld(level, transformedOrigin, transformedOrigin, settings, level.random, 2);
+
+            // 4. Connect the newly placed building to the nearest village road
+            this.connectToNearestRoad(level, size, isDesert);
+
+            level.playSound(null, this.buildOrigin, SoundEvents.VILLAGER_CELEBRATE, SoundSource.NEUTRAL, 1.2F, 1.0F);
+            level.sendParticles(ParticleTypes.HAPPY_VILLAGER,
+                    this.buildOrigin.getX() + size.getX() / 2.0D,
+                    this.buildOrigin.getY() + 2.0D,
+                    this.buildOrigin.getZ() + size.getZ() / 2.0D,
+                    15, 2.0D, 1.5D, 2.0D, 0.0D);
+        }
+
+        private void connectToNearestRoad(ServerLevel level, net.minecraft.core.Vec3i size, boolean isDesert) {
+            BlockPos startPoint = this.buildOrigin.offset(size.getX() / 2, 0, size.getZ() / 2);
+            for (BlockPos pos : BlockPos.betweenClosed(this.buildOrigin, this.buildOrigin.offset(size.getX(), 2, size.getZ()))) {
+                if (level.getBlockState(pos).getBlock() instanceof net.minecraft.world.level.block.DoorBlock) {
+                    startPoint = pos.immutable();
+                    break;
+                }
+            }
+            BlockPos nearestRoad = null;
+            double bestDistSq = 256.0D;
+            for (int dx = -16; dx <= 16; dx++) {
+                for (int dz = -16; dz <= 16; dz++) {
+                    int wx = startPoint.getX() + dx;
+                    int wz = startPoint.getZ() + dz;
+                    if (wx >= this.buildOrigin.getX() && wx <= this.buildOrigin.getX() + size.getX()
+                            && wz >= this.buildOrigin.getZ() && wz <= this.buildOrigin.getZ() + size.getZ()) {
+                        continue;
+                    }
+                    int wy = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz) - 1;
+                    BlockPos check = new BlockPos(wx, wy, wz);
+                    BlockState state = level.getBlockState(check);
+                    if (state.is(net.minecraft.world.level.block.Blocks.DIRT_PATH) || state.is(net.minecraft.world.level.block.Blocks.SMOOTH_SANDSTONE)) {
+                        double distSq = check.distSqr(startPoint);
+                        if (distSq < bestDistSq) {
+                            bestDistSq = distSq;
+                            nearestRoad = check;
+                        }
+                    }
+                }
+            }
+            if (nearestRoad == null) return;
+            BlockState pathState = isDesert
+                    ? net.minecraft.world.level.block.Blocks.SMOOTH_SANDSTONE.defaultBlockState()
+                    : net.minecraft.world.level.block.Blocks.DIRT_PATH.defaultBlockState();
+            int curX = startPoint.getX();
+            int curZ = startPoint.getZ();
+            int targetX = nearestRoad.getX();
+            int targetZ = nearestRoad.getZ();
+            while (curX != targetX || curZ != targetZ) {
+                if (curX != targetX) {
+                    curX += Integer.compare(targetX, curX);
+                } else {
+                    curZ += Integer.compare(targetZ, curZ);
+                }
+                int surfaceY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, curX, curZ) - 1;
+                BlockPos groundPos = new BlockPos(curX, surfaceY, curZ);
+                BlockState ground = level.getBlockState(groundPos);
+                if (ground.is(net.minecraft.world.level.block.Blocks.GRASS_BLOCK)
+                        || ground.is(net.minecraft.world.level.block.Blocks.DIRT)
+                        || ground.is(net.minecraft.world.level.block.Blocks.SAND)) {
+                    level.setBlock(groundPos, pathState, 3);
+                }
+            }
+        }
+        @Override
+        public void stop() {
+            this.mason.getPersistentData().remove("IsConstructing");
+            this.mason.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+            this.remainingBuildTicks = 0;
+        }
+    }
+
+    private static class StayNearVillageAnchorGoal extends Goal {
+        private final Villager villager;
+        private BlockPos closestAnchor;
+        private int checkCooldown = 40;
+
+        public StayNearVillageAnchorGoal(Villager villager) {
+            this.villager = villager;
+            this.setFlags(EnumSet.of(Flag.MOVE));
+        }
+
+        @Override
+        public boolean canUse() {
+            if (!(this.villager.level() instanceof ServerLevel level) || this.villager.isBaby()) {
+                return false;
+            }
+            // Don't interfere with active raids, sermons, or village abandonment migration
+            if (level.getRaidAt(this.villager.blockPosition()) != null
+                    || this.villager.getPersistentData().getBoolean("IsConstructing")
+                    || this.villager.getPersistentData().getBoolean("IsEducatingNitwit")) {
+                return false;
+            }
+            if (--this.checkCooldown > 0) {
+                return false;
+            }
+            this.checkCooldown = 40; // Check every 2 seconds
+
+            this.closestAnchor = this.findClosestAnchor(level);
+            if (this.closestAnchor == null) {
+                return false;
+            }
+
+            // Trigger if the villager drifted more than 20 blocks away from their nearest anchor
+            return this.villager.blockPosition().distSqr(this.closestAnchor) > 400.0D;
+        }
+
+        @Override
+        public boolean canContinueToUse() {
+            if (this.closestAnchor == null || this.villager.getNavigation().isDone()) {
+                return false;
+            }
+            // Stop once back within 10 blocks of their home, workplace, or bell
+            return this.villager.blockPosition().distSqr(this.closestAnchor) > 100.0D;
+        }
+
+        @Override
+        public void start() {
+            if (this.closestAnchor != null) {
+                this.villager.getNavigation().moveTo(
+                        this.closestAnchor.getX() + 0.5D,
+                        this.closestAnchor.getY(),
+                        this.closestAnchor.getZ() + 0.5D,
+                        0.55D
+                );
+            }
+        }
+
+        @Nullable
+        private BlockPos findClosestAnchor(ServerLevel level) {
+            BlockPos currentPos = this.villager.blockPosition();
+            List<BlockPos> anchors = new ArrayList<>();
+
+            BlockPos ownedBed = VillageBedSavedData.get(level).getOwnedBed(this.villager.getUUID());
+            if (ownedBed != null) {
+                anchors.add(ownedBed);
+            }
+
+            this.villager.getBrain().getMemory(MemoryModuleType.JOB_SITE).ifPresent(globalPos -> {
+                if (globalPos.dimension() == level.dimension()) {
+                    anchors.add(globalPos.pos());
+                }
+            });
+
+            BlockPos center = VillagerLifeHandler.getVillageCenter(level, currentPos);
+            anchors.add(center);
+
+            anchors.sort(Comparator.comparingDouble(pos -> pos.distSqr(currentPos)));
+            return anchors.isEmpty() ? null : anchors.get(0);
+        }
+    }
 }

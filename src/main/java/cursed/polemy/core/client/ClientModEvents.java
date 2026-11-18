@@ -1,14 +1,12 @@
 package cursed.polemy.core.client;
 
 import cursed.polemy.Polemy;
-import cursed.polemy.core.client.models.GuardVillagerModel;
-import cursed.polemy.core.client.models.InvokerModel;
-import cursed.polemy.core.client.models.LareModel;
-import cursed.polemy.core.client.models.WardModel;
+import cursed.polemy.core.client.models.*;
 import cursed.polemy.core.client.renderers.WardRuneRenderer;
 import cursed.polemy.core.entity.AbstractVillagerExtra;
 import cursed.polemy.core.entity.mobs.Invoker;
 import cursed.polemy.core.entity.mobs.Lares;
+import cursed.polemy.core.entity.mobs.Rogue;
 import cursed.polemy.registry.entities.MobsPolemy;
 import net.minecraft.client.renderer.entity.MobRenderer;
 import net.minecraft.client.renderer.entity.layers.ItemInHandLayer;
@@ -19,7 +17,7 @@ import net.minecraftforge.client.event.EntityRenderersEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 
-@Mod.EventBusSubscriber(modid = "polemy", bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
+@Mod.EventBusSubscriber(modid = Polemy.MODID, bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
 public class ClientModEvents {
 
     @SubscribeEvent
@@ -29,6 +27,7 @@ public class ClientModEvents {
         event.registerLayerDefinition(InvokerModel.LAYER_LOCATION, InvokerModel::createBodyLayer);
         event.registerLayerDefinition(LareModel.LAYER_LOCATION, LareModel::createBodyLayer);
         event.registerLayerDefinition(WardModel.LAYER_LOCATION, WardModel::createBodyLayer);
+        event.registerLayerDefinition(RogueModel.LAYER_LOCATION, RogueModel::createBodyLayer);
     }
 
     @SubscribeEvent
@@ -45,7 +44,6 @@ public class ClientModEvents {
             return renderer;
         });
 
-        // 2. Sentry (with ItemInHandLayer so bow renders)
         event.registerEntityRenderer(MobsPolemy.SENTRY.get(), ctx -> {
             MobRenderer<AbstractVillagerExtra, GuardVillagerModel<AbstractVillagerExtra>> renderer =
                     new MobRenderer<>(ctx, new GuardVillagerModel<>(ctx.bakeLayer(GuardVillagerModel.SENTRY_LAYER)), 0.5F) {
@@ -58,7 +56,6 @@ public class ClientModEvents {
             return renderer;
         });
 
-        // 3. Invoker
         event.registerEntityRenderer(MobsPolemy.INVOKER.get(), ctx ->
                 new MobRenderer<Invoker, InvokerModel<Invoker>>(ctx, new InvokerModel<>(ctx.bakeLayer(InvokerModel.LAYER_LOCATION)), 0.5F) {
                     @Override
@@ -67,8 +64,6 @@ public class ClientModEvents {
                     }
                 });
 
-
-        // 4. Lares (glows in the dark like a Vex via getBlockLightLevel)
         event.registerEntityRenderer(MobsPolemy.LARES.get(), ctx ->
                 new MobRenderer<Lares, LareModel<Lares>>(ctx, new LareModel<>(ctx.bakeLayer(LareModel.LAYER_LOCATION)), 0.3F) {
                     @Override
@@ -84,5 +79,18 @@ public class ClientModEvents {
 
         // 5. Ward Rune
         event.registerEntityRenderer(MobsPolemy.WARD_RUNE.get(), WardRuneRenderer::new);
+
+        // 6. Rogue (with ItemInHandLayer so the sword renders when arms unfold)
+        event.registerEntityRenderer(MobsPolemy.ROGUE.get(), ctx -> {
+            MobRenderer<Rogue, RogueModel<Rogue>> renderer =
+                    new MobRenderer<>(ctx, new RogueModel<>(ctx.bakeLayer(RogueModel.LAYER_LOCATION)), 0.5F) {
+                        @Override
+                        public ResourceLocation getTextureLocation(Rogue entity) {
+                            return new ResourceLocation(Polemy.MODID, "textures/entity/rogue.png");
+                        }
+                    };
+            renderer.addLayer(new ItemInHandLayer<>(renderer, ctx.getItemInHandRenderer()));
+            return renderer;
+        });
     }
 }

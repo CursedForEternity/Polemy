@@ -2,6 +2,7 @@ package cursed.polemy.core.entity;
 
 import cursed.polemy.Polemy;
 import cursed.polemy.core.entity.mobs.Lares;
+import cursed.polemy.core.entity.mobs.Rogue;
 import cursed.polemy.core.entity.mobs.Sentry;
 import cursed.polemy.registry.entities.MobsPolemy;
 import net.minecraftforge.event.entity.EntityAttributeCreationEvent;
@@ -16,5 +17,6 @@ public class ModEventBusEvents {
         event.put(MobsPolemy.INVOKER.get(), AbstractVillagerExtra.createCombatAttributes().build());
         event.put(MobsPolemy.SENTRY.get(), Sentry.createSentryAttributes().build());
         event.put(MobsPolemy.LARES.get(), Lares.createAttributes().build());
+        event.put(MobsPolemy.ROGUE.get(), Rogue.createRogueAttributes().build());
     }
 }

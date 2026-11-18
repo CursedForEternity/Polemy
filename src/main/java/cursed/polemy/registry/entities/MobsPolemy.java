@@ -41,6 +41,14 @@ public class MobsPolemy {
                     .updateInterval(1)
                     .build("ward_rune"));
 
+    public static final RegistryObject<EntityType<Rogue>> ROGUE =
+            ENTITY_TYPES.register("rogue", () -> EntityType.Builder
+                    .of(Rogue::new, MobCategory.MISC)
+                    .sized(0.6F, 1.95F)
+                    .clientTrackingRange(8)
+                    .build("rogue"));
+
+
     public static void register(IEventBus eventBus) {
         ENTITY_TYPES.register(eventBus);
     }
